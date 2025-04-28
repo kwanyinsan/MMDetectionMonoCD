@@ -14,17 +14,6 @@ from mmdet.evaluation import DumpDetResults
 from mmdet.registry import RUNNERS
 from mmdet.utils import setup_cache_size_limit_of_dynamo
 
-from mmengine.hooks import Hook
-
-class DumpHeatmapHook(Hook):
-    """Saves raw heatmap tensor after each test iteration."""
-    def after_test_iter(self, runner):
-        # runner.outputs contains {'visualize_preds': {'heat_map': Tensor}}
-        hm = runner.outputs['visualize_preds']['heat_map']  # shape=[N,C,H,W]
-        out_dir = os.path.join(runner.work_dir, 'heatmaps')
-        os.makedirs(out_dir, exist_ok=True)
-        np.save(os.path.join(out_dir, f'heatmap_iter{runner.iter}.npy'),
-                hm.cpu().numpy())
 
 # TODO: support fuse_conv_bn and format_only
 def parse_args():
@@ -144,10 +133,6 @@ def main():
         # build customized runner from the registry
         # if 'runner_type' is set in the cfg
         runner = RUNNERS.build(cfg)
-
-    # ─── Register our heatmap dump hook ─────────────────────────────────
-    runner.register_hook(DumpHeatmapHook(), priority='LOW')
-    # ─────────────────────────────────────────────────────────────────────
 
     # add `DumpResults` dummy metric
     if args.out is not None:
