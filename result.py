@@ -1,76 +1,196 @@
-import argparse
+import os
 import cv2
 import numpy as np
-from data.datasets.kitti_utils import (
-    Calibration,      # [data/datasets/kitti_utils.py#L329]
-    read_label,       # [data/datasets/kitti_utils.py#L142]
-    compute_box_3d,   # [data/datasets/kitti_utils.py#L666]
-    draw_projected_box3d  # [data/datasets/kitti_utils.py#L804]
-)
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
 
-def main(image_path, depth_txt, label_txt, calib_txt, out_img, out_txt):
-    # 1) load inputs
-    img = cv2.imread(image_path)
-    depth_map = np.loadtxt(depth_txt)            # shape: H×W in meters
-    calib = Calibration(calib_txt)               # KITTI calib parser
+# === Configurable paths ===
+KITTI_ROOT   = "/path/to/your/kitti/"            # your KITTI root
+VIS_DIR      = "output/visualization"            # depth_*.txt, boxes3d_*.png
+BOX2D_DIR    = "boxes2d"                         # 2D bbox txt files
+IMGSET_FILE  = os.path.join(KITTI_ROOT, "training", "ImageSets", "val.txt")
 
-    # 2) parse objects
-    objs = read_label(label_txt)                 # list of Object3d
+# KITTI subfolders
+IMG_DIR    = os.path.join(KITTI_ROOT, "training", "image_2")
+CALIB_DIR  = os.path.join(KITTI_ROOT, "training", "calib")
 
-    # accum corners for TXT dump
-    all_corners3d = []
+# where to put all outputs
+RESULT_DIR = os.path.join(os.getcwd(), "result")
+os.makedirs(RESULT_DIR, exist_ok=True)
 
-    for obj in objs:
-        # 3) pick a depth per‐object (here at 2D‐bbox center)
-        u = int((obj.xmin + obj.xmax) / 2)
-        v = int((obj.ymin + obj.ymax) / 2)
-        d = float(depth_map[v, u])
+# sanity-check existence of folders
+for d in (IMG_DIR, CALIB_DIR, VIS_DIR, BOX2D_DIR):
+    if not os.path.isdir(d):
+        raise FileNotFoundError(f"Directory not found: {d}")
+if not os.path.isfile(IMGSET_FILE):
+    raise FileNotFoundError(f"File not found: {IMGSET_FILE}")
 
-        # 4) project uv+d → 3D center (optional, not used below)
-        # center3d = calib.project_image_to_rect(np.array([[u, v, d]]))[0]
+# === Helper functions ===
+def load_calibration(calib_path):
+    with open(calib_path, 'r') as f:
+        for line in f:
+            if line.startswith('P2:'):
+                vals = list(map(float, line.split()[1:]))
+                return np.array(vals).reshape(3,4)
+    raise ValueError(f"P2 not found in {calib_path}")
 
-        # 5) compute the 8 corners in rect‐camera coords
-        corners2d, corners3d = compute_box_3d(obj, calib.P)
+def compute_3d_box(h, w, l, x, y, z, ry):
+    x_c = [ l/2,  l/2, -l/2, -l/2,  l/2,  l/2, -l/2, -l/2]
+    y_c = [   0,    0,    0,    0,   -h,   -h,   -h,   -h]
+    z_c = [ w/2, -w/2, -w/2,  w/2,  w/2, -w/2, -w/2,  w/2]
+    corners = np.vstack((x_c, y_c, z_c))
+    R = np.array([
+        [ np.cos(ry), 0, np.sin(ry)],
+        [          0, 1,          0],
+        [-np.sin(ry), 0, np.cos(ry)]
+    ])
+    return (R @ corners + np.array([[x],[y],[z]])).T
 
-        print(f"corners2d: {corners2d}, corners3d: {corners3d}")
-        if corners2d is None:
+def project_to_image(pts3d, P):
+    pts_hom = np.hstack((pts3d, np.ones((pts3d.shape[0],1))))
+    proj    = (P @ pts_hom.T)
+    proj[:2] /= proj[2:3]
+    return proj[:2].T
+
+def draw_3d_box(img, pts2d, color=(0,255,0), thickness=2):
+    pts = pts2d.astype(int)
+    edges = [
+        (0,1),(1,2),(2,3),(3,0),
+        (4,5),(5,6),(6,7),(7,4),
+        (0,4),(1,5),(2,6),(3,7)
+    ]
+    for i,j in edges:
+        cv2.line(img, tuple(pts[i]), tuple(pts[j]), color, thickness)
+
+def objective_hwl(hwl, label, P2):
+    h, w, l = hwl
+    x, y, z = label["location"]
+    ry       = label["rotation_y"]
+    corners3d = compute_3d_box(h, w, l, x, y, z, ry)
+    corners2d = project_to_image(corners3d, P2)
+    xmin_p, ymin_p = corners2d.min(axis=0)
+    xmax_p, ymax_p = corners2d.max(axis=0)
+    bx1, by1, bx2, by2 = label["bbox"]
+    dx = ((bx1+bx2)/2) - ((xmin_p+xmax_p)/2)
+    dy = ((by1+by2)/2) - ((ymin_p+ymax_p)/2)
+    dw = (bx2-bx1)     - (xmax_p-xmin_p)
+    dh = (by2-by1)     - (ymax_p-ymin_p)
+    return dx*dx + dy*dy + dw*dw + dh*dh
+
+def estimate_3d_boxes(img, depth, P2, boxes2d):
+    K_inv = np.linalg.inv(P2[:,:3])
+    labels = []
+    for box in boxes2d:
+        u = (box[0]+box[2])/2; v = (box[1]+box[3])/2
+        ui, vi = int(round(u)), int(round(v))
+        if not (0 <= vi < depth.shape[0] and 0 <= ui < depth.shape[1]):
             continue
+        Z = depth[vi, ui]
+        if Z <= 0:
+            continue
+        X, Y, Z = Z * (K_inv @ np.array([u, v, 1.0]))
+        h0, w0, l0 = 1.52, 1.63, 3.88
+        Y += h0/2
+        ry    = np.arctan2(X, Z)
+        alpha = ((ry - np.arctan2(X, Z) + np.pi) % (2*np.pi)) - np.pi
 
-        # store for TXT
-        all_corners3d.append(corners3d)
+        lbl = {
+            "type":       "Car",
+            "truncation": 0.0,
+            "occlusion":  0,
+            "alpha":      alpha,
+            "bbox":       box,
+            "location":   [X, Y, Z],
+            "rotation_y": ry,
+            "dimensions": [h0, w0, l0]
+        }
+        res = minimize(objective_hwl, [h0,w0,l0], args=(lbl,P2), bounds=[(1,3),(1,3),(2,6)])
+        lbl["dimensions"] = res.x.tolist()
+        corners3d        = compute_3d_box(*lbl["dimensions"], *lbl["location"], lbl["rotation_y"])
+        lbl["corners_2d"] = project_to_image(corners3d, P2)
+        labels.append(lbl)
+    return labels
 
-        # 6) draw 3D box on image
-        img = draw_projected_box3d(
-            img,
-            corners2d.astype(np.int32),
-            color=(0,255,0),
-        )
+# === Main loop over val set ===
+with open(IMGSET_FILE, 'r') as f:
+    img_ids = [l.strip() for l in f if l.strip()]
 
-    # 7) save visualization
-    cv2.imwrite(out_img, img)
+for img_id in img_ids:
+    # build paths
+    image_path   = os.path.join(IMG_DIR,    f"{img_id}.png")
+    calib_path   = os.path.join(CALIB_DIR,  f"{img_id}.txt")
+    boxes2d_path = os.path.join(BOX2D_DIR,  f"{img_id}.txt")
+    depth_path   = os.path.join(VIS_DIR,    f"depth_{img_id}.txt")
+    monocd_path  = os.path.join(VIS_DIR,    f"boxes3d_{img_id}.png")
 
-    # 8) dump corners to TXT
-    with open(out_txt, 'w') as f:
-        for corners3d in all_corners3d:
-            # corners3d: (8,3)
-            for x, y, z in corners3d.reshape(-1, 3):
-                f.write(f"{x:.3f} {y:.3f} {z:.3f}\n")
-            f.write("\n")
+    # load original
+    img = cv2.imread(image_path)
+    if img is None:
+        print(f"[{img_id}] missing image, skipping")
+        continue
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image",   required=True,  help="path to RGB image")
-    parser.add_argument("--depth",   required=True,  help="path to depth TXT")
-    parser.add_argument("--label",   required=True,  help="path to KITTI .txt label")
-    parser.add_argument("--calib",   required=True,  help="path to KITTI calib file")
-    parser.add_argument("--out_img", default="out_with_3d.png", help="where to save visualized image")
-    parser.add_argument("--out_txt", default="corners3d.txt",   help="where to save 3D corners")
-    args = parser.parse_args()
-    main(
-        args.image,
-        args.depth,
-        args.label,
-        args.calib,
-        args.out_img,
-        args.out_txt,
-    )
+    # check 2D file
+    lines = []
+    if os.path.isfile(boxes2d_path):
+        with open(boxes2d_path,'r') as f:
+            lines = [l for l in f if l.strip()]
+    empty_2d = (len(lines)==0)
+
+    # 1) 2D output
+    out2d = os.path.join(RESULT_DIR, f"2d_{img_id}.png")
+    if empty_2d:
+        cv2.imwrite(out2d, img)
+    else:
+        boxes2d = np.loadtxt(boxes2d_path)
+        if boxes2d.ndim==0: boxes2d=boxes2d.reshape(0,4)
+        elif boxes2d.ndim==1: boxes2d=boxes2d[np.newaxis,:]
+        img2d = img.copy()
+        for x1,y1,x2,y2 in boxes2d:
+            cv2.rectangle(img2d,(int(x1),int(y1)),(int(x2),int(y2)),(255,0,0),2)
+        cv2.imwrite(out2d,img2d)
+
+    # 2) 3D output
+    out3d = os.path.join(RESULT_DIR, f"3d_{img_id}.png")
+    can3d = not empty_2d and os.path.isfile(depth_path)
+    if not can3d:
+        cv2.imwrite(out3d, img)
+    else:
+        depth = np.loadtxt(depth_path)
+        P2    = load_calibration(calib_path)
+        boxes2d = np.loadtxt(boxes2d_path)
+        if boxes2d.ndim==0: boxes2d=boxes2d.reshape(0,4)
+        elif boxes2d.ndim==1: boxes2d=boxes2d[np.newaxis,:]
+        labels = estimate_3d_boxes(img, depth, P2, boxes2d)
+        img3d  = img.copy()
+        for lbl in labels:
+            draw_3d_box(img3d, np.array(lbl["corners_2d"]))
+        cv2.imwrite(out3d, img3d)
+
+    # 3) comparison
+    cmp_out = os.path.join(RESULT_DIR, f"compare_{img_id}.png")
+    mono = cv2.imread(monocd_path) if os.path.isfile(monocd_path) else img
+    mmd  = cv2.imread(out3d)
+    mono = cv2.cvtColor(mono,cv2.COLOR_BGR2RGB)
+    mmd  = cv2.cvtColor(mmd, cv2.COLOR_BGR2RGB)
+    fig, (a1,a2)=plt.subplots(1,2,figsize=(12,6))
+    a1.imshow(mono);a1.set_title("MonoCD");a1.axis("off")
+    a2.imshow(mmd);a2.set_title("MMDetection");a2.axis("off")
+    plt.tight_layout();plt.savefig(cmp_out,bbox_inches="tight");plt.close(fig)
+
+    # 4) KITTI‐style label file (always create)
+    label_out = os.path.join(RESULT_DIR, f"{img_id}.txt")
+    with open(label_out,'w') as f:
+        if not empty_2d:
+            for lbl in labels:
+                x1,y1,x2,y2=lbl["bbox"]
+                h,w,l   =lbl["dimensions"]
+                X,Y,Z   =lbl["location"]
+                ry,alp  =lbl["rotation_y"],lbl["alpha"]
+                f.write(
+                    f"{lbl['type']} {lbl['truncation']:.2f} {lbl['occlusion']} "
+                    f"{alp:.2f} {x1:.2f} {y1:.2f} {x2:.2f} {y2:.2f} "
+                    f"{h:.2f} {w:.2f} {l:.2f} "
+                    f"{X:.2f} {Y:.2f} {Z:.2f} {ry:.2f}\n"
+                )
+
+    print(f"[{img_id}] → 2D:{os.path.basename(out2d)}, 3D:{os.path.basename(out3d)}, cmp:{os.path.basename(cmp_out)}, label:{os.path.basename(label_out)}")
